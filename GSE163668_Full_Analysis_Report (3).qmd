@@ -1,0 +1,1510 @@
+---
+title: "GSE163668 Single-Cell RNA-seq Analysis"
+author: "Mohamed Ahmed Hamed"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+# GSE163668 Single-Cell RNA-seq Analysis
+
+This report runs the whole analysis from scratch on any machine: it downloads the raw data from GEO, performs QC, doublet removal, Harmony integration, clustering, annotation, pseudobulk differential expression (edgeR) and GSEA (GO Biological Process). Heavy steps are saved as checkpoints, so re-rendering is fast. Set `force_rerun <- TRUE` in section 2 to recompute everything.
+
+## 1. Load required packages
+
+```{r}
+needed <- c(
+  "Seurat", "SeuratObject", "SingleCellExperiment", "scDblFinder", "harmony",
+  "dplyr", "tidyr", "ggplot2", "patchwork", "edgeR", "clusterProfiler",
+  "org.Hs.eg.db", "enrichplot", "GEOquery", "stringr", "Matrix"
+)
+
+missing_pkgs <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    "Missing packages: ", paste(missing_pkgs, collapse = ", "),
+    "\nInstall them first, e.g. BiocManager::install(c(",
+    paste0("\"", missing_pkgs, "\"", collapse = ", "), "))"
+  )
+}
+
+if (!requireNamespace("presto", quietly = TRUE)) {
+  message("Optional: install 'presto' (remotes::install_github('immunogenomics/presto')) for a much faster FindAllMarkers.")
+}
+
+library(Seurat)
+library(SeuratObject)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(harmony)
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+library(edgeR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(GEOquery)
+library(stringr)
+```
+
+## 2. Define directories, flags and helpers
+
+```{r}
+set.seed(42)
+options(timeout = 7200)
+
+# ---------------------------------------------------------------
+# EDIT THIS LINE ONLY: any folder with enough free disk space
+# (the raw GEO archive + extracted files take several GB).
+# ---------------------------------------------------------------
+base_dir <- "D:/SUBSPACE_data/GSE163668"
+
+raw_dir           <- file.path(base_dir, "raw")
+extracted_dir     <- file.path(base_dir, "extracted")
+final_project_dir <- file.path(base_dir, "FINAL_PROJECT")
+fig_dir           <- file.path(final_project_dir, "Final_Figures")
+gsea_dir          <- file.path(final_project_dir, "GSEA_eps0")
+de_dir            <- file.path(base_dir, "DE_all_celltypes")
+ckpt_dir          <- file.path(final_project_dir, "checkpoints")
+
+for (d in c(raw_dir, extracted_dir, fig_dir, gsea_dir, de_dir, ckpt_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Set TRUE to ignore all checkpoints and recompute everything.
+force_rerun <- FALSE
+
+n_expected_samples <- 38
+
+clustered_rds  <- file.path(ckpt_dir, "01_sepsis_full_clustered.rds")
+qc_rds         <- file.path(ckpt_dir, "02_qc_objects.rds")
+markers_rds    <- file.path(base_dir, "markers_all_clusters.rds")
+de_file        <- file.path(de_dir, "all_celltypes_edgeR_results.rds")
+gsea_file      <- file.path(gsea_dir, "combined_GSEA_eps0.csv")
+
+# Optional: manual annotation exported from the other machine (see section 16).
+annotation_csv <- file.path(base_dir, "cell_type_annotation.csv")
+
+# TRUE  -> run sections 3-13 (heavy preprocessing)
+# FALSE -> load the saved clustered object instead
+run_pre   <- force_rerun || !file.exists(clustered_rds)
+use_cache <- !run_pre
+
+cached <- function(path, expr) {
+  if (!force_rerun && file.exists(path)) {
+    return(readRDS(path))
+  }
+  res <- expr
+  saveRDS(res, path)
+  res
+}
+
+if (run_pre) {
+  message("Preprocessing will run from scratch (no clustered checkpoint found).")
+} else {
+  message("Clustered checkpoint found: sections 3-13 are skipped and the object is loaded.")
+}
+```
+
+# 3. Download and extract the raw data
+
+The archive is downloaded from GEO only if the 38 matrix files are not already in `extracted_dir`.
+
+```{r}
+#| eval: !expr run_pre
+find_mtx <- function() {
+  list.files(
+    extracted_dir,
+    pattern = "matrix\\.mtx\\.gz$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+}
+
+if (length(find_mtx()) != n_expected_samples) {
+
+  find_tar <- function() {
+    list.files(raw_dir, pattern = "RAW\\.tar$", full.names = TRUE)
+  }
+
+  tar_dest <- file.path(raw_dir, "GSE163668_RAW.tar")
+
+  urls <- c(
+    "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE163nnn/GSE163668/suppl/GSE163668_RAW.tar",
+    "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE163668&format=file",
+    "ftp://ftp.ncbi.nlm.nih.gov/geo/series/GSE163nnn/GSE163668/suppl/GSE163668_RAW.tar"
+  )
+
+  for (u in urls) {
+    if (length(find_tar()) > 0) break
+    message("Trying: ", u)
+
+    for (meth in c("libcurl", "wininet")) {
+      if (meth == "wininet" && .Platform$OS.type != "windows") next
+      if (length(find_tar()) > 0) break
+
+      ok <- tryCatch(
+        {
+          download.file(u, destfile = tar_dest, mode = "wb", method = meth)
+          TRUE
+        },
+        error = function(e) {
+          message("  failed (", meth, "): ", conditionMessage(e))
+          FALSE
+        },
+        warning = function(w) {
+          message("  warning (", meth, "): ", conditionMessage(w))
+          FALSE
+        }
+      )
+
+      # Remove partial / failed downloads
+      if (!ok && file.exists(tar_dest) && file.size(tar_dest) < 1e6) file.remove(tar_dest)
+    }
+  }
+
+  if (length(find_tar()) == 0) {
+    stop(
+      "Could not download the GEO archive from this machine (network/firewall issue).\n",
+      "Download 'GSE163668_RAW.tar' manually from\n",
+      "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE163668 (Supplementary file, 'http' link)\n",
+      "or from a phone hotspot / another network, and put it in:\n  ", raw_dir,
+      "\nThen render again; extraction is automatic."
+    )
+  }
+
+  tar_path <- find_tar()[1]
+  message("Extracting ", tar_path)
+  untar(tar_path, exdir = extracted_dir)
+}
+
+length(find_mtx())
+head(basename(find_mtx()), 5)
+```
+
+# 4. Read the 38 samples
+
+```{r}
+#| eval: !expr run_pre
+matrix_files <- sort(find_mtx())
+
+if (length(matrix_files) != n_expected_samples) {
+  stop(
+    "Expected ", n_expected_samples, " matrix files in extracted_dir but found ",
+    length(matrix_files), ". Check the folder and file names before rendering."
+  )
+}
+```
+
+```{r}
+#| eval: !expr run_pre
+read_one_sample <- function(mtx_file) {
+
+  prefix <- sub("matrix\\.mtx\\.gz$", "", mtx_file)
+  sample_id <- sub("_matrix\\.mtx\\.gz$", "", basename(mtx_file))
+
+  cells_file <- paste0(prefix, "barcodes.tsv.gz")
+
+  features_file <- paste0(prefix, "features.tsv.gz")
+  if (!file.exists(features_file)) {
+    features_file <- paste0(prefix, "genes.tsv.gz")
+  }
+
+  stopifnot(file.exists(cells_file), file.exists(features_file))
+
+  data <- ReadMtx(
+    mtx = mtx_file,
+    cells = cells_file,
+    features = features_file,
+    feature.column = 2
+  )
+
+  obj_sample <- CreateSeuratObject(
+    counts = data,
+    project = "GSE163668",
+    min.cells = 3,
+    min.features = 200
+  )
+
+  obj_sample$sample_id <- sample_id
+
+  obj_sample
+}
+
+GSE163668_list <- lapply(matrix_files, read_one_sample)
+
+names(GSE163668_list) <- vapply(
+  GSE163668_list,
+  function(x) x$sample_id[1],
+  character(1)
+)
+
+length(GSE163668_list)
+```
+
+# 5. Quality control
+
+## 5.1. Calculate mitochondrial percentage
+
+```{r}
+#| eval: !expr run_pre
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+    x[["percent.mt"]] <- PercentageFeatureSet(x, pattern = "^MT-")
+    x
+  }
+)
+```
+
+## 5.2. QC before filtering
+
+```{r}
+#| eval: !expr run_pre
+qc_summary <- do.call(
+  rbind,
+  lapply(
+    GSE163668_list,
+    function(x) {
+      data.frame(
+        sample_id = x$sample_id[1],
+        cells = ncol(x),
+        median_features = median(x$nFeature_RNA),
+        median_counts = median(x$nCount_RNA),
+        median_mt = median(x$percent.mt),
+        mean_mt = mean(x$percent.mt)
+      )
+    }
+  )
+)
+rownames(qc_summary) <- NULL
+
+qc_summary
+```
+
+```{r}
+#| eval: !expr run_pre
+VlnPlot(
+  GSE163668_list[[1]],
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3,
+  pt.size = 0
+)
+```
+
+## 5.3. Cell filtering
+
+```{r}
+#| eval: !expr run_pre
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+    subset(
+      x,
+      subset =
+        nFeature_RNA > 200 &
+        nFeature_RNA < 6000 &
+        percent.mt < 10
+    )
+  }
+)
+```
+
+## 5.4. QC after filtering
+
+```{r}
+#| eval: !expr run_pre
+qc_after <- do.call(
+  rbind,
+  lapply(
+    GSE163668_list,
+    function(x) {
+      data.frame(
+        sample_id = x$sample_id[1],
+        cells_after = ncol(x)
+      )
+    }
+  )
+)
+rownames(qc_after) <- NULL
+
+qc_after
+```
+
+# 6. Doublet detection
+
+scDblFinder is run on raw counts of each library separately. The seed is fixed for reproducibility; if scDblFinder fails on a very small library, the sample is kept and flagged in the summary table.
+
+```{r}
+#| eval: !expr run_pre
+sample_names <- names(GSE163668_list)
+
+GSE163668_list <- lapply(
+  sample_names,
+  function(nm) {
+
+    x <- GSE163668_list[[nm]]
+
+    counts <- LayerData(x, assay = "RNA", layer = "counts")
+    sce <- SingleCellExperiment(assays = list(counts = counts))
+
+    res <- tryCatch(
+      {
+        set.seed(42)
+        scDblFinder(sce, verbose = FALSE)
+      },
+      error = function(e) {
+        warning("scDblFinder failed for ", nm, ": ", conditionMessage(e))
+        NULL
+      }
+    )
+
+    if (is.null(res)) {
+      x$doublet_class <- "singlet"
+      x$doublet_score <- NA_real_
+      x$doublet_failed <- TRUE
+    } else {
+      idx <- match(colnames(x), colnames(res))
+      x$doublet_class <- as.character(res$scDblFinder.class[idx])
+      x$doublet_score <- res$scDblFinder.score[idx]
+      x$doublet_failed <- FALSE
+    }
+
+    x
+  }
+)
+
+names(GSE163668_list) <- sample_names
+```
+
+## 6.1. Doublet summary
+
+```{r}
+#| eval: !expr run_pre
+doublet_table <- do.call(
+  rbind,
+  lapply(
+    GSE163668_list,
+    function(x) {
+      data.frame(
+        sample_id = x$sample_id[1],
+        cells = ncol(x),
+        doublets = sum(x$doublet_class == "doublet"),
+        doublet_pct = round(100 * mean(x$doublet_class == "doublet"), 1),
+        scdblfinder_failed = isTRUE(x$doublet_failed[1])
+      )
+    }
+  )
+)
+rownames(doublet_table) <- NULL
+
+doublet_table
+
+table(unlist(lapply(GSE163668_list, function(x) x$doublet_class)))
+```
+
+## 6.2. Keep singlets
+
+```{r}
+#| eval: !expr run_pre
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+    subset(x, subset = doublet_class == "singlet")
+  }
+)
+```
+
+## 6.3. Final cell numbers after QC
+
+```{r}
+#| eval: !expr run_pre
+cell_counts_final <- vapply(GSE163668_list, ncol, numeric(1))
+
+cell_counts_final
+sum(cell_counts_final)
+```
+
+# 7. Normalize each sample
+
+```{r}
+#| eval: !expr run_pre
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    x <- NormalizeData(
+      x,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+
+    x <- FindVariableFeatures(
+      x,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+
+    x
+  }
+)
+```
+
+## 7.1. Check variable features
+
+```{r}
+#| eval: !expr run_pre
+all(
+  vapply(
+    GSE163668_list,
+    function(x) length(VariableFeatures(x)) == 2000,
+    logical(1)
+  )
+)
+
+# Save the QC tables so the report can still show them when later
+# renders reuse the clustered checkpoint.
+saveRDS(
+  list(
+    qc_summary = qc_summary,
+    qc_after = qc_after,
+    doublet_table = doublet_table,
+    cell_counts_final = cell_counts_final
+  ),
+  qc_rds
+)
+```
+
+# 8. Merge all 38 samples and select integration features
+
+```{r}
+#| eval: !expr run_pre
+sepsis_full <- merge(
+  x = GSE163668_list[[1]],
+  y = GSE163668_list[-1],
+  add.cell.ids = names(GSE163668_list),
+  project = "GSE163668"
+)
+
+dim(sepsis_full)
+length(Cells(sepsis_full))
+```
+
+```{r}
+#| eval: !expr run_pre
+VariableFeatures(sepsis_full) <-
+  SelectIntegrationFeatures(
+    object.list = GSE163668_list,
+    nfeatures = 2000
+  )
+
+length(VariableFeatures(sepsis_full))
+
+# The per-sample list is no longer needed; free memory.
+rm(GSE163668_list)
+invisible(gc())
+```
+
+# 9. Scaling and PCA
+
+```{r}
+#| eval: !expr run_pre
+sepsis_full <- ScaleData(
+  sepsis_full,
+  features = VariableFeatures(sepsis_full),
+  verbose = FALSE
+)
+
+sepsis_full <- RunPCA(
+  sepsis_full,
+  features = VariableFeatures(sepsis_full),
+  npcs = 30,
+  verbose = FALSE
+)
+```
+
+# 10. Harmony batch correction
+
+```{r}
+#| eval: !expr run_pre
+# Harmony compatibility workaround:
+# RunHarmony.Seurat in some installed package combinations passes the
+# legacy argument assay.use to RunHarmony.default, which newer Harmony
+# versions reject. Run Harmony directly on the PCA embeddings instead.
+# The first two arguments are passed by position so the call works
+# whatever the first argument is called in the installed Harmony version.
+
+pca_embeddings <- Seurat::Embeddings(
+  sepsis_full,
+  reduction = "pca"
+)[, 1:20, drop = FALSE]
+
+harmony_metadata <- sepsis_full@meta.data[
+  rownames(pca_embeddings),
+  "sample_id",
+  drop = FALSE
+]
+
+stopifnot(
+  nrow(pca_embeddings) == nrow(harmony_metadata),
+  !anyNA(harmony_metadata$sample_id)
+)
+
+harmony_embeddings <- harmony::RunHarmony(
+  pca_embeddings,
+  harmony_metadata,
+  vars_use = "sample_id",
+  verbose = FALSE
+)
+
+# Add corrected embeddings back to the Seurat object.
+rownames(harmony_embeddings) <- rownames(pca_embeddings)
+colnames(harmony_embeddings) <- paste0(
+  "harmony_",
+  seq_len(ncol(harmony_embeddings))
+)
+
+sepsis_full[["harmony"]] <- Seurat::CreateDimReducObject(
+  embeddings = harmony_embeddings,
+  key = "harmony_",
+  assay = Seurat::DefaultAssay(sepsis_full)
+)
+```
+
+# 11. Neighbors and clustering
+
+```{r}
+#| eval: !expr run_pre
+sepsis_full <- FindNeighbors(
+  sepsis_full,
+  reduction = "harmony",
+  dims = 1:20,
+  verbose = FALSE
+)
+
+sepsis_full <- FindClusters(
+  sepsis_full,
+  resolution = 0.5,
+  random.seed = 42,
+  verbose = FALSE
+)
+```
+
+# 12. UMAP
+
+```{r}
+#| eval: !expr run_pre
+sepsis_full <- RunUMAP(
+  sepsis_full,
+  reduction = "harmony",
+  dims = 1:20,
+  seed.use = 42,
+  verbose = FALSE
+)
+```
+
+# 13. Prepare the object for downstream analysis and save the checkpoint
+
+`scale.data` layers are not needed for the Wilcoxon markers or for pseudobulk DE and are very large, so they are dropped. The per-sample `counts` and `data` layers are then joined (required by `FindAllMarkers`).
+
+```{r}
+#| eval: !expr run_pre
+DefaultAssay(sepsis_full) <- "RNA"
+
+rna_assay <- sepsis_full[["RNA"]]
+scale_layers <- grep("^scale\\.data", Layers(rna_assay), value = TRUE)
+
+for (l in scale_layers) {
+  tryCatch(
+    LayerData(rna_assay, layer = l) <- NULL,
+    error = function(e) message("Could not drop layer ", l, ": ", conditionMessage(e))
+  )
+}
+
+sepsis_full[["RNA"]] <- rna_assay
+rm(rna_assay)
+invisible(gc())
+
+sepsis_full[["RNA"]] <- JoinLayers(sepsis_full[["RNA"]])
+
+Layers(sepsis_full[["RNA"]])
+
+saveRDS(sepsis_full, clustered_rds)
+```
+
+```{r}
+#| eval: !expr use_cache
+sepsis_full <- readRDS(clustered_rds)
+message("Loaded clustered checkpoint: ", ncol(sepsis_full), " cells.")
+```
+
+## 13.1. QC tables
+
+```{r}
+if (file.exists(qc_rds)) {
+  qc_objects <- readRDS(qc_rds)
+
+  print(qc_objects$qc_summary)
+  print(qc_objects$qc_after)
+  print(qc_objects$doublet_table)
+  cat("Cells after QC and doublet removal:", sum(qc_objects$cell_counts_final), "\n")
+} else {
+  message("QC tables are not available (no QC checkpoint); run with force_rerun <- TRUE to regenerate them.")
+}
+```
+
+## 13.2. Elbow plot
+
+```{r}
+ElbowPlot(sepsis_full, ndims = 30)
+```
+
+## 13.3. Basic object summary
+
+```{r}
+dim(sepsis_full)
+length(unique(sepsis_full$sample_id))
+
+table(sepsis_full$seurat_clusters)
+```
+
+## 13.4. UMAP by sample
+
+```{r}
+DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "sample_id",
+  raster = TRUE
+) + NoLegend()
+```
+
+## 13.5. UMAP by cluster
+
+```{r}
+DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE,
+  repel = TRUE,
+  raster = TRUE
+)
+```
+
+# 14. Cluster marker analysis
+
+**Important:** This marker analysis uses all cells; no cell subsampling is performed.
+
+```{r}
+Idents(sepsis_full) <- "seurat_clusters"
+
+markers <- cached(
+  markers_rds,
+  FindAllMarkers(
+    sepsis_full,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25,
+    test.use = "wilcox"
+  )
+)
+
+markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(avg_log2FC, n = 5) %>%
+  dplyr::ungroup() %>%
+  as.data.frame()
+```
+
+# 15. Cell-type annotation
+
+Two modes are supported:
+
+1. **Manual annotation (recommended for reproducing the original labels).** If `cell_type_annotation.csv` (columns `cell`, `cell_type`) exists in `base_dir`, labels are transferred by cell name. Cell names are `<sample_id>_<barcode>` and do not depend on cluster numbering. Create the file on the machine that has the annotated object with:
+   `write.csv(data.frame(cell = colnames(sepsis_full), cell_type = sepsis_full$cell_type), "cell_type_annotation.csv", row.names = FALSE)`
+2. **Automatic draft.** Otherwise each cluster is labelled by the canonical marker set with the highest z-scored module score. This is a draft: clusters flagged `needs_review` and the dot plot must be checked, and labels can be overridden with `manual_cluster_map`.
+
+```{r}
+marker_sets <- list(
+  "Neutrophils"   = c("FCGR3B", "CSF3R", "CXCR2", "G0S2", "NAMPT", "S100A8", "S100A9", "IFITM2"),
+  "Monocytes"     = c("CD14", "LYZ", "CST3", "FCN1", "VCAN", "LST1", "FCGR3A", "MS4A7"),
+  "DC"            = c("FCER1A", "CD1C", "CLEC10A", "CLEC9A"),
+  "pDC"           = c("LILRA4", "IRF7", "CLEC4C", "TCF4", "IL3RA", "PLD4"),
+  "T cells"       = c("CD3D", "CD3E", "CD3G", "IL7R", "TRAC", "CD2", "LCK"),
+  "NK cells"      = c("NKG7", "GNLY", "KLRD1", "KLRF1", "NCAM1", "PRF1", "GZMA"),
+  "B cells"       = c("MS4A1", "CD79A", "CD79B", "BANK1", "CD19", "CD22"),
+  "Plasmablasts"  = c("JCHAIN", "MZB1", "XBP1", "SDC1", "TNFRSF17", "PRDM1"),
+  "Platelets"     = c("PPBP", "PF4", "GNG11", "TUBB1", "NRGN", "GP9", "CAVIN2"),
+  "Erythroid"     = c("HBB", "HBA1", "HBA2", "ALAS2", "SLC4A1", "AHSP", "CA1", "GYPA"),
+  "Cycling cells" = c("MKI67", "TOP2A", "STMN1", "TYMS", "PCLAF", "CENPF", "UBE2C")
+)
+
+marker_sets <- lapply(marker_sets, function(g) intersect(g, rownames(sepsis_full)))
+
+# Optional manual override for the automatic mode, e.g. c("17" = "Cycling cells")
+manual_cluster_map <- c()
+
+cluster_ann <- NULL
+
+if (file.exists(annotation_csv)) {
+
+  ann <- read.csv(annotation_csv, stringsAsFactors = FALSE)
+  stopifnot(all(c("cell", "cell_type") %in% colnames(ann)))
+
+  ct <- ann$cell_type[match(colnames(sepsis_full), ann$cell)]
+  matched_pct <- 100 * mean(!is.na(ct))
+
+  message(sprintf("Manual annotation: %.1f%% of cells matched by name.", matched_pct))
+  if (matched_pct < 95) {
+    warning("Less than 95% of cells matched the annotation file. Check that sample names are identical.")
+  }
+
+  ct[is.na(ct)] <- "Unassigned"
+  sepsis_full$cell_type <- ct
+  annotation_source <- "manual annotation file"
+
+} else {
+
+  sepsis_full <- AddModuleScore(
+    sepsis_full,
+    features = marker_sets,
+    name = "ms_",
+    assay = "RNA",
+    seed = 42
+  )
+
+  score_cols <- paste0("ms_", seq_along(marker_sets))
+  ms <- sepsis_full@meta.data[, score_cols, drop = FALSE]
+  colnames(ms) <- names(marker_sets)
+  sepsis_full@meta.data[, score_cols] <- NULL
+
+  cl_means <- aggregate(
+    ms,
+    by = list(cluster = as.character(sepsis_full$seurat_clusters)),
+    FUN = mean
+  )
+  rownames(cl_means) <- cl_means$cluster
+
+  z <- scale(as.matrix(cl_means[, names(marker_sets), drop = FALSE]))
+
+  top_names <- t(apply(z, 1, function(r) names(sort(r, decreasing = TRUE))[1:2]))
+  top_vals  <- t(apply(z, 1, function(r) sort(r, decreasing = TRUE)[1:2]))
+
+  cluster_ann <- data.frame(
+    cluster = rownames(z),
+    auto_label = top_names[, 1],
+    runner_up = top_names[, 2],
+    z_top = round(top_vals[, 1], 2),
+    z_margin = round(top_vals[, 1] - top_vals[, 2], 2),
+    n_cells = as.vector(table(sepsis_full$seurat_clusters)[rownames(z)]),
+    stringsAsFactors = FALSE
+  )
+  cluster_ann$needs_review <- cluster_ann$z_margin < 0.5
+  cluster_ann <- cluster_ann[order(as.integer(cluster_ann$cluster)), ]
+  rownames(cluster_ann) <- NULL
+
+  cluster_ann$final_label <- cluster_ann$auto_label
+  if (length(manual_cluster_map) > 0) {
+    hit <- match(names(manual_cluster_map), cluster_ann$cluster)
+    cluster_ann$final_label[hit] <- unname(manual_cluster_map)
+  }
+
+  sepsis_full$cell_type <- cluster_ann$final_label[
+    match(as.character(sepsis_full$seurat_clusters), cluster_ann$cluster)
+  ]
+
+  annotation_source <- "automatic marker-based draft"
+}
+
+sepsis_full$cell_type <- as.character(sepsis_full$cell_type)
+stopifnot(!anyNA(sepsis_full$cell_type))
+
+cat("Annotation source:", annotation_source, "\n")
+
+if (!is.null(cluster_ann)) cluster_ann
+
+sort(table(sepsis_full$cell_type), decreasing = TRUE)
+```
+
+## 15.1. Marker check for the annotation
+
+```{r}
+#| fig-width: 14
+#| fig-height: 7
+dot_genes <- unique(unlist(lapply(marker_sets, head, 3)))
+
+DotPlot(
+  sepsis_full,
+  features = dot_genes,
+  group.by = "seurat_clusters"
+) +
+  RotatedAxis()
+```
+
+# 16. UMAP by annotated cell type
+
+```{r}
+Idents(sepsis_full) <- "cell_type"
+
+p_umap_celltype <- DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "cell_type",
+  label = TRUE,
+  repel = TRUE,
+  raster = TRUE
+) +
+  ggtitle("GSE163668: UMAP by Cell Type") +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.text = element_text(size = 8)
+  )
+
+p_umap_celltype
+```
+
+# 17. Clinical group annotation
+
+```{r}
+pheno_csv <- file.path(ckpt_dir, "GSE163668_sample_metadata.csv")
+
+if (file.exists(pheno_csv)) {
+
+  pheno2 <- read.csv(pheno_csv, stringsAsFactors = FALSE)
+
+} else {
+
+  gse <- tryCatch(
+    getGEO("GSE163668", GSEMatrix = FALSE, destdir = raw_dir),
+    error = function(e) {
+      stop(
+        "Could not download the GEO sample metadata (no internet / cannot reach NCBI).\n",
+        "Connect to the internet and render again. Everything before this step is saved,\n",
+        "so the next render resumes quickly and only this step needs the connection.\n\n",
+        "Original error: ", conditionMessage(e)
+      )
+    }
+  )
+
+  pheno2 <- do.call(
+    rbind,
+    lapply(
+      GSMList(gse),
+      function(g) {
+        data.frame(
+          gsm = Meta(g)$geo_accession,
+          title = Meta(g)$title,
+          characteristics = paste(Meta(g)$characteristics_ch1, collapse = " | "),
+          stringsAsFactors = FALSE
+        )
+      }
+    )
+  )
+  rownames(pheno2) <- NULL
+
+  write.csv(pheno2, pheno_csv, row.names = FALSE)
+}
+
+nrow(pheno2)
+```
+
+```{r}
+sample_meta <- pheno2 %>%
+  dplyr::transmute(
+    gsm = gsm,
+    title = title,
+    pooled = str_detect(characteristics, "pooled: TRUE"),
+    covid_status = str_trim(
+      str_match(characteristics, "covid_status: ([^|]+)")[, 2]
+    ),
+    phenotype = str_trim(
+      str_match(characteristics, "phenotype: ([^|]+)")[, 2]
+    )
+  ) %>%
+  dplyr::mutate(
+    group = dplyr::case_when(
+      pooled ~ "Pooled",
+      phenotype == "CONTROL" ~ "Control",
+      covid_status == "POSITIVE" & phenotype == "SEVERE" ~ "COVID_SEVERE",
+      covid_status == "POSITIVE" & phenotype == "M/M" ~ "COVID_MM",
+      covid_status == "NEGATIVE" ~ "COVID_NEG_patient",
+      TRUE ~ NA_character_
+    )
+  )
+
+table(sample_meta$group, useNA = "ifany")
+```
+
+```{r}
+sepsis_full$gsm <- sub("_.*", "", sepsis_full$sample_id)
+
+idx <- match(sepsis_full$gsm, sample_meta$gsm)
+
+sepsis_full$group  <- sample_meta$group[idx]
+sepsis_full$pooled <- sample_meta$pooled[idx]
+
+if (anyNA(sepsis_full$group)) {
+  bad_gsm <- unique(sepsis_full$gsm[is.na(sepsis_full$group)])
+  stop(
+    "Some cells could not be assigned to a clinical group. Problem GSM ids: ",
+    paste(bad_gsm, collapse = ", ")
+  )
+}
+
+group_levels <- c("Control", "COVID_NEG_patient", "COVID_MM", "COVID_SEVERE", "Pooled")
+
+table(sepsis_full$group, useNA = "ifany")
+```
+
+# 18. UMAP by clinical group
+
+```{r}
+p_umap_group <- DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "group",
+  raster = TRUE
+) +
+  ggtitle("GSE163668: UMAP by Clinical Group") +
+  theme_classic()
+
+p_umap_group
+```
+
+# 19. Cell counts by clinical group
+
+```{r}
+group_counts <- as.data.frame(table(sepsis_full$group))
+colnames(group_counts) <- c("Group", "Number_of_Cells")
+
+# Counts from the earlier analysis run, shown only as a sanity check.
+previous_counts <- c(
+  Control = 19029,
+  COVID_MM = 19722,
+  COVID_NEG_patient = 6412,
+  COVID_SEVERE = 8503,
+  Pooled = 31229
+)
+
+group_counts$Previous_run <- previous_counts[as.character(group_counts$Group)]
+
+group_counts
+```
+
+```{r}
+p_group_counts <- ggplot(
+  group_counts,
+  aes(x = reorder(Group, Number_of_Cells), y = Number_of_Cells)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Cell Distribution Across Clinical Groups",
+    x = NULL,
+    y = "Number of Cells"
+  ) +
+  theme_classic()
+
+p_group_counts
+```
+
+# 20. Cell-type composition by clinical group
+
+Composition is computed per biological sample (pooled multi-patient libraries are excluded because they cannot be assigned to one group).
+
+```{r}
+meta_np <- sepsis_full@meta.data %>%
+  dplyr::filter(group != "Pooled", cell_type != "Unassigned")
+
+comp_tab <- table(meta_np$sample_id, meta_np$cell_type)
+
+comp_prop <- as.data.frame(prop.table(comp_tab, margin = 1), stringsAsFactors = FALSE)
+colnames(comp_prop) <- c("sample_id", "cell_type", "proportion")
+comp_prop$group <- meta_np$group[match(comp_prop$sample_id, meta_np$sample_id)]
+comp_prop$group <- factor(
+  comp_prop$group,
+  levels = c("Control", "COVID_NEG_patient", "COVID_MM", "COVID_SEVERE")
+)
+
+write.csv(
+  comp_prop,
+  file.path(fig_dir, "Cell_type_proportions_per_sample.csv"),
+  row.names = FALSE
+)
+
+comp_test <- do.call(
+  rbind,
+  lapply(
+    unique(comp_prop$cell_type),
+    function(ct) {
+      d <- comp_prop[
+        comp_prop$cell_type == ct &
+          comp_prop$group %in% c("COVID_MM", "COVID_SEVERE"),
+      ]
+      d$group <- droplevels(d$group)
+      if (nlevels(d$group) < 2) return(NULL)
+
+      data.frame(
+        cell_type = ct,
+        median_prop_MM = median(d$proportion[d$group == "COVID_MM"]),
+        median_prop_SEVERE = median(d$proportion[d$group == "COVID_SEVERE"]),
+        p_value = tryCatch(
+          wilcox.test(proportion ~ group, data = d, exact = FALSE)$p.value,
+          error = function(e) NA_real_
+        )
+      )
+    }
+  )
+)
+
+if (!is.null(comp_test) && nrow(comp_test) > 0) {
+  comp_test$p_adj <- p.adjust(comp_test$p_value, method = "BH")
+  comp_test <- comp_test[order(comp_test$p_value), ]
+  rownames(comp_test) <- NULL
+}
+
+comp_test
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+p_composition <- ggplot(
+  comp_prop,
+  aes(x = group, y = proportion, fill = group)
+) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 1) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  labs(
+    title = "Cell-type Proportions per Sample",
+    x = NULL,
+    y = "Proportion of cells in sample"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    legend.position = "none"
+  )
+
+p_composition
+```
+
+# 21. Pseudobulk differential expression (edgeR)
+
+Counts are summed per biological sample and cell type. Pooled libraries and the `Unassigned` label are excluded. For each cell type and comparison, an edgeR quasi-likelihood model is fitted only when both groups have enough samples, each with enough cells.
+
+```{r}
+# (test group, reference group)
+comparisons <- list(
+  COVID_MM_vs_Control      = c("COVID_MM", "Control"),
+  COVID_SEVERE_vs_Control  = c("COVID_SEVERE", "Control"),
+  COVID_SEVERE_vs_COVID_MM = c("COVID_SEVERE", "COVID_MM"),
+  COVID_NEG_vs_Control     = c("COVID_NEG_patient", "Control")
+)
+
+min_cells_pb     <- 10   # minimum cells in a sample x cell type pseudobulk
+min_samples_group <- 3   # minimum pseudobulk samples per group
+```
+
+```{r}
+meta_all <- sepsis_full@meta.data
+
+keep_cells <- meta_all$group != "Pooled" & meta_all$cell_type != "Unassigned"
+
+counts_mat <- LayerData(sepsis_full, assay = "RNA", layer = "counts")[, keep_cells]
+
+pb_key <- factor(
+  paste(meta_all$sample_id[keep_cells], meta_all$cell_type[keep_cells], sep = "||")
+)
+
+pb_indicator <- Matrix::sparseMatrix(
+  i = seq_along(pb_key),
+  j = as.integer(pb_key),
+  x = 1,
+  dims = c(length(pb_key), nlevels(pb_key)),
+  dimnames = list(NULL, levels(pb_key))
+)
+
+pb_counts <- as.matrix(counts_mat %*% pb_indicator)
+
+parts <- do.call(rbind, strsplit(levels(pb_key), "||", fixed = TRUE))
+
+pb_meta <- data.frame(
+  pb_id = levels(pb_key),
+  sample_id = parts[, 1],
+  cell_type = parts[, 2],
+  n_cells = as.vector(table(pb_key)),
+  stringsAsFactors = FALSE
+)
+pb_meta$group <- meta_all$group[match(pb_meta$sample_id, meta_all$sample_id)]
+
+rm(counts_mat, pb_indicator)
+invisible(gc())
+
+dim(pb_counts)
+table(pb_meta$cell_type, pb_meta$group)
+```
+
+```{r}
+de_one <- function(ct, test, ref) {
+
+  sel <- pb_meta$cell_type == ct &
+    pb_meta$group %in% c(test, ref) &
+    pb_meta$n_cells >= min_cells_pb
+
+  m <- pb_meta[sel, ]
+  n_test <- sum(m$group == test)
+  n_ref  <- sum(m$group == ref)
+
+  if (n_test < min_samples_group || n_ref < min_samples_group) {
+    return(list(
+      status = sprintf("skipped (n_%s=%d, n_%s=%d)", test, n_test, ref, n_ref),
+      n_test = n_test,
+      n_ref = n_ref,
+      table = NULL
+    ))
+  }
+
+  y <- DGEList(
+    counts = pb_counts[, m$pb_id, drop = FALSE],
+    group = factor(m$group, levels = c(ref, test))
+  )
+
+  keep <- filterByExpr(y)
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- calcNormFactors(y)
+
+  design <- model.matrix(~ group, data = y$samples)
+
+  y <- estimateDisp(y, design)
+  fit <- glmQLFit(y, design)
+  qlf <- glmQLFTest(fit, coef = 2)
+
+  tt <- topTags(qlf, n = Inf)$table
+  tt$gene <- rownames(tt)
+
+  list(status = "ok", n_test = n_test, n_ref = n_ref, table = tt)
+}
+
+all_DE_results <- cached(
+  de_file,
+  {
+    cell_types <- sort(unique(pb_meta$cell_type))
+
+    res <- lapply(
+      cell_types,
+      function(ct) {
+        lapply(
+          comparisons,
+          function(cmp) de_one(ct, test = cmp[1], ref = cmp[2])
+        )
+      }
+    )
+    names(res) <- cell_types
+    res
+  }
+)
+
+names(all_DE_results)
+```
+
+## 21.1. DE summary (FDR < 0.05)
+
+```{r}
+de_summary <- do.call(
+  rbind,
+  lapply(
+    names(all_DE_results),
+    function(ct) {
+      do.call(
+        rbind,
+        lapply(
+          names(all_DE_results[[ct]]),
+          function(cmp) {
+            r <- all_DE_results[[ct]][[cmp]]
+            tt <- r$table
+            data.frame(
+              cell_type = ct,
+              comparison = cmp,
+              status = r$status,
+              n_test = r$n_test,
+              n_ref = r$n_ref,
+              genes_tested = if (is.null(tt)) NA_integer_ else nrow(tt),
+              sig_genes = if (is.null(tt)) NA_integer_ else sum(tt$FDR < 0.05),
+              up = if (is.null(tt)) NA_integer_ else sum(tt$FDR < 0.05 & tt$logFC > 0),
+              down = if (is.null(tt)) NA_integer_ else sum(tt$FDR < 0.05 & tt$logFC < 0)
+            )
+          }
+        )
+      )
+    }
+  )
+)
+rownames(de_summary) <- NULL
+
+write.csv(de_summary, file.path(de_dir, "DE_summary.csv"), row.names = FALSE)
+
+de_summary
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+p_de_counts <- ggplot(
+  de_summary,
+  aes(x = comparison, y = cell_type, fill = sig_genes)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(is.na(sig_genes), "n/a", sig_genes)), size = 3) +
+  scale_fill_viridis_c(option = "C", name = "DE genes\n(FDR < 0.05)", na.value = "grey90") +
+  labs(
+    title = "Pseudobulk DE Genes by Comparison",
+    x = "Comparison",
+    y = "Cell type"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+p_de_counts
+```
+
+# 22. GSEA (GO Biological Process)
+
+Genes are ranked by the signed significance `sign(logFC) * -log10(PValue)` from the edgeR results, and `gseGO` is run with `eps = 0`. All pathways are kept in the table (`pvalueCutoff = 1`); significance is applied afterwards using `p.adjust < 0.05`.
+
+```{r}
+run_gsea_one <- function(tt) {
+
+  p <- pmax(tt$PValue, 1e-300)
+  ranks <- sign(tt$logFC) * -log10(p)
+  names(ranks) <- tt$gene
+
+  ranks <- ranks[is.finite(ranks)]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  if (length(ranks) < 200) return(NULL)
+
+  res <- gseGO(
+    geneList = ranks,
+    OrgDb = org.Hs.eg.db,
+    keyType = "SYMBOL",
+    ont = "BP",
+    minGSSize = 10,
+    maxGSSize = 500,
+    eps = 0,
+    pvalueCutoff = 1,
+    pAdjustMethod = "BH",
+    verbose = FALSE,
+    seed = TRUE
+  )
+
+  out <- as.data.frame(res)
+  if (nrow(out) == 0) return(NULL)
+  rownames(out) <- NULL
+  out
+}
+
+if (!force_rerun && file.exists(gsea_file)) {
+
+  gsea <- read.csv(gsea_file, check.names = FALSE)
+
+} else {
+
+  gsea_list <- list()
+
+  for (ct in names(all_DE_results)) {
+    for (cmp in names(all_DE_results[[ct]])) {
+
+      tt <- all_DE_results[[ct]][[cmp]]$table
+      if (is.null(tt)) next
+
+      message("GSEA: ", ct, " | ", cmp)
+
+      set.seed(42)
+      res <- tryCatch(
+        run_gsea_one(tt),
+        error = function(e) {
+          warning("GSEA failed for ", ct, " | ", cmp, ": ", conditionMessage(e))
+          NULL
+        }
+      )
+
+      if (!is.null(res)) {
+        res$cell_type <- ct
+        res$comparison <- cmp
+        gsea_list[[paste(ct, cmp, sep = "|")]] <- res
+      }
+    }
+  }
+
+  gsea <- dplyr::bind_rows(gsea_list)
+
+  if (nrow(gsea) == 0) {
+    stop("GSEA produced no results. Check the DE summary above (too few samples per group?).")
+  }
+
+  write.csv(gsea, gsea_file, row.names = FALSE)
+}
+
+dim(gsea)
+colnames(gsea)
+head(gsea[, c("cell_type", "comparison", "Description", "NES", "p.adjust")])
+```
+
+# 23. Significant GSEA pathways
+
+```{r}
+gsea_sig <- gsea %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < 0.05)
+
+nrow(gsea_sig)
+```
+
+```{r}
+pathway_counts <- gsea_sig %>%
+  dplyr::count(comparison, cell_type, name = "significant_pathways")
+
+all_grid <- expand.grid(
+  comparison = names(comparisons),
+  cell_type = sort(unique(gsea$cell_type)),
+  stringsAsFactors = FALSE
+)
+
+pathway_counts <- all_grid %>%
+  dplyr::left_join(pathway_counts, by = c("comparison", "cell_type")) %>%
+  dplyr::mutate(significant_pathways = tidyr::replace_na(significant_pathways, 0L))
+
+write.csv(
+  pathway_counts,
+  file.path(fig_dir, "GSEA_Significant_Pathway_Counts.csv"),
+  row.names = FALSE
+)
+
+aggregate(
+  significant_pathways ~ comparison,
+  data = pathway_counts,
+  FUN = sum
+)
+```
+
+# 24. Final GSEA figure
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+p_gsea_counts <- ggplot(
+  pathway_counts,
+  aes(x = comparison, y = cell_type, fill = significant_pathways)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = significant_pathways), size = 3) +
+  scale_fill_viridis_c(option = "C", name = "Significant\npathways") +
+  labs(
+    title = "Significant GSEA Pathways by Comparison",
+    subtitle = "GO Biological Process; adjusted P value < 0.05",
+    x = "Comparison",
+    y = "Cell type"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    panel.grid = element_blank()
+  )
+
+p_gsea_counts
+```
+
+# 25. Final object summary
+
+```{r}
+cat("Final dimensions:\n")
+print(dim(sepsis_full))
+
+cat("\nTotal cells:\n")
+print(ncol(sepsis_full))
+
+cat("\nTotal features:\n")
+print(nrow(sepsis_full))
+
+cat("\nCell types:\n")
+print(sort(table(sepsis_full$cell_type), decreasing = TRUE))
+
+cat("\nClinical groups:\n")
+print(table(sepsis_full$group))
+```
+
+# 26. Save final Seurat object
+
+```{r}
+final_rds <- file.path(final_project_dir, "GSE163668_FINAL_seurat.rds")
+
+saveRDS(sepsis_full, final_rds)
+
+file.exists(final_rds)
+```
+
+# 27. Save final figures
+
+```{r}
+ggsave(
+  file.path(fig_dir, "Figure1_UMAP_CellType.png"),
+  p_umap_celltype, width = 13, height = 9, dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure2_UMAP_Group.png"),
+  p_umap_group, width = 11, height = 8, dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure3_CellCounts_ByGroup.png"),
+  p_group_counts, width = 9, height = 6, dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure4_Composition_ByGroup.png"),
+  p_composition, width = 14, height = 9, dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure5_DE_Genes_ByComparison.png"),
+  p_de_counts, width = 10, height = 6, dpi = 300
+)
+
+ggsave(
+  file.path(fig_dir, "Figure6_GSEA_Significant_Pathways.png"),
+  p_gsea_counts, width = 12, height = 8, dpi = 300
+)
+```
+
+# 28. Final verification
+
+```{r}
+list.files(fig_dir, full.names = TRUE)
+```
+
+# 29. Session information
+
+```{r}
+sessionInfo()
+```
