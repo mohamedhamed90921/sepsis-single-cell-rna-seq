@@ -48,3 +48,16 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+# Quarto cache and generated files
+.quarto/
+*_cache/
+*_files/
+
+# Large raw sequencing data
+*.fastq
+*.fastq.gz
+*.bam
+*.cram
+*.tar
+*.h5
+*.h5ad
