@@ -1,0 +1,974 @@
+title: "GSE163668 Single-Cell RNA-seq Analysis"
+author: "Mohamed Ahmed Hamed"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+# GSE163668 Single-Cell RNA-seq Analysis
+
+## 1. Load required packages
+
+```{r}
+library(Seurat)
+library(SeuratObject)
+library(SingleCellExperiment)
+library(scDblFinder)
+library(harmony)
+
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+library(edgeR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(GEOquery)
+library(stringr)
+```
+
+## 2. Define directories
+
+```{r}
+base_dir <- "D:/SUBSPACE_data/GSE163668"
+
+extracted_dir <- file.path(
+  base_dir,
+  "extracted"
+)
+
+final_project_dir <- file.path(
+  base_dir,
+  "FINAL_PROJECT"
+)
+
+fig_dir <- file.path(
+  final_project_dir,
+  "Final_Figures"
+)
+
+gsea_dir <- file.path(
+  final_project_dir,
+  "GSEA_eps0"
+)
+
+dir.create(
+  fig_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+# 3. Read the 38 samples
+
+```{r}
+matrix_files <- list.files(
+  extracted_dir,
+  pattern = "matrix\\.mtx\\.gz$",
+  full.names = TRUE
+)
+
+length(matrix_files)
+
+if (length(matrix_files) != 38) {
+  stop("Expected 38 matrix files in extracted_dir. Check the folder and file names before rendering.")
+}
+```
+
+```{r}
+GSE163668_list <- lapply(
+  matrix_files,
+  function(mtx_file) {
+
+    sample_id <- sub(
+      "_matrix\\.mtx\\.gz$",
+      "",
+      basename(mtx_file)
+    )
+
+    cells_file <- file.path(
+      extracted_dir,
+      paste0(sample_id, "_barcodes.tsv.gz")
+    )
+
+    features_file <- file.path(
+      extracted_dir,
+      paste0(sample_id, "_features.tsv.gz")
+    )
+
+    data <- ReadMtx(
+      mtx = mtx_file,
+      cells = cells_file,
+      features = features_file,
+      feature.column = 2
+    )
+
+    obj_sample <- CreateSeuratObject(
+      counts = data,
+      project = "GSE163668",
+      min.cells = 3,
+      min.features = 200
+    )
+
+    obj_sample$sample_id <- sample_id
+
+    obj_sample
+  }
+)
+
+names(GSE163668_list) <- sapply(
+  GSE163668_list,
+  function(x) unique(x$sample_id)
+)
+
+length(GSE163668_list)
+```
+
+# 4. Quality control
+
+## 4.1. Calculate mitochondrial percentage
+
+```{r}
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    x[["percent.mt"]] <- PercentageFeatureSet(
+      x,
+      pattern = "^MT-"
+    )
+
+    x
+  }
+)
+```
+
+## 4.2. QC before filtering
+
+```{r}
+qc_summary <- do.call(
+  rbind,
+  lapply(
+    GSE163668_list,
+    function(x) {
+
+      data.frame(
+        sample_id = unique(x$sample_id),
+        cells = ncol(x),
+        median_features = median(x$nFeature_RNA),
+        median_counts = median(x$nCount_RNA),
+        median_mt = median(x$percent.mt),
+        mean_mt = mean(x$percent.mt)
+      )
+    }
+  )
+)
+
+qc_summary
+```
+
+```{r}
+VlnPlot(
+  GSE163668_list[[1]],
+  features = c(
+    "nFeature_RNA",
+    "nCount_RNA",
+    "percent.mt"
+  ),
+  ncol = 3
+)
+```
+
+## 4.3. Cell filtering
+
+```{r}
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    x <- subset(
+      x,
+      subset =
+        nFeature_RNA > 200 &
+        nFeature_RNA < 6000 &
+        percent.mt < 10
+    )
+
+    x
+  }
+)
+```
+
+## 4.4. QC after filtering
+
+```{r}
+qc_after <- do.call(
+  rbind,
+  lapply(
+    GSE163668_list,
+    function(x) {
+
+      data.frame(
+        sample_id = unique(x$sample_id),
+        cells_after = ncol(x)
+      )
+    }
+  )
+)
+
+qc_after
+```
+
+# 5. Doublet detection
+
+```{r}
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    sce <- as.SingleCellExperiment(x)
+
+    sce <- scDblFinder(sce)
+
+    x$doublet_class <-
+      sce$scDblFinder.class
+
+    x$doublet_score <-
+      sce$scDblFinder.score
+
+    x
+  }
+)
+```
+
+## 5.1. Doublet summary
+
+```{r}
+table(
+  unlist(
+    lapply(
+      GSE163668_list,
+      function(x) x$doublet_class
+    )
+  )
+)
+```
+
+## 5.2. Keep singlets
+
+```{r}
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    subset(
+      x,
+      subset = doublet_class == "singlet"
+    )
+  }
+)
+```
+
+## 5.3. Final cell numbers after QC
+
+```{r}
+cell_counts_final <- sapply(
+  GSE163668_list,
+  ncol
+)
+
+cell_counts_final
+sum(cell_counts_final)
+```
+
+# 6. Normalize each sample
+
+```{r}
+GSE163668_list <- lapply(
+  GSE163668_list,
+  function(x) {
+
+    x <- NormalizeData(
+      x,
+      normalization.method = "LogNormalize",
+      scale.factor = 10000,
+      verbose = FALSE
+    )
+
+    x <- FindVariableFeatures(
+      x,
+      selection.method = "vst",
+      nfeatures = 2000,
+      verbose = FALSE
+    )
+
+    x
+  }
+)
+```
+
+## 6.1. Check variable features
+
+```{r}
+all(
+  sapply(
+    GSE163668_list,
+    function(x)
+      length(VariableFeatures(x)) == 2000
+  )
+)
+```
+
+# 7. Merge all 38 samples
+
+```{r}
+sepsis_full <- merge(
+  x = GSE163668_list[[1]],
+  y = GSE163668_list[-1],
+  add.cell.ids = names(GSE163668_list),
+  project = "GSE163668"
+)
+
+dim(sepsis_full)
+length(Cells(sepsis_full))
+```
+
+# 8. Select integration features
+
+```{r}
+VariableFeatures(sepsis_full) <-
+  SelectIntegrationFeatures(
+    object.list = GSE163668_list,
+    nfeatures = 2000
+  )
+
+length(
+  VariableFeatures(sepsis_full)
+)
+```
+
+# 9. Scaling and PCA
+
+```{r}
+sepsis_full <- ScaleData(
+  sepsis_full,
+  features = VariableFeatures(sepsis_full),
+  verbose = TRUE
+)
+```
+
+```{r}
+sepsis_full <- RunPCA(
+  sepsis_full,
+  features = VariableFeatures(sepsis_full),
+  npcs = 30,
+  verbose = TRUE
+)
+```
+
+## 9.1. Elbow plot
+
+```{r}
+ElbowPlot(
+  sepsis_full,
+  ndims = 30
+)
+```
+
+# 10. Harmony batch correction
+
+```{r}
+# Harmony compatibility workaround:
+# RunHarmony.Seurat in some installed package combinations passes the
+# legacy argument assay.use to RunHarmony.default, which newer Harmony
+# versions reject. Run Harmony directly on the PCA embeddings instead.
+
+pca_embeddings <- Seurat::Embeddings(
+  sepsis_full,
+  reduction = "pca"
+)[, 1:20, drop = FALSE]
+
+harmony_metadata <- sepsis_full@meta.data[
+  rownames(pca_embeddings),
+  "sample_id",
+  drop = FALSE
+]
+
+stopifnot(
+  nrow(pca_embeddings) == nrow(harmony_metadata),
+  !anyNA(harmony_metadata$sample_id)
+)
+
+harmony_embeddings <- harmony::RunHarmony(
+  data_mat = pca_embeddings,
+  meta_data = harmony_metadata,
+  vars_use = "sample_id",
+  verbose = TRUE
+)
+
+# Add corrected embeddings back to the Seurat object.
+rownames(harmony_embeddings) <- rownames(pca_embeddings)
+colnames(harmony_embeddings) <- paste0(
+  "harmony_",
+  seq_len(ncol(harmony_embeddings))
+)
+
+sepsis_full[["harmony"]] <- Seurat::CreateDimReducObject(
+  embeddings = harmony_embeddings,
+  key = "harmony_",
+  assay = Seurat::DefaultAssay(sepsis_full)
+)
+```
+
+# 11. Neighbors and clustering
+
+```{r}
+sepsis_full <- FindNeighbors(
+  sepsis_full,
+  reduction = "harmony",
+  dims = 1:20
+)
+```
+
+```{r}
+sepsis_full <- FindClusters(
+  sepsis_full,
+  resolution = 0.5
+)
+```
+
+```{r}
+table(
+  sepsis_full$seurat_clusters
+)
+```
+
+# 12. UMAP
+
+```{r}
+sepsis_full <- RunUMAP(
+  sepsis_full,
+  reduction = "harmony",
+  dims = 1:20
+)
+```
+
+## 12.1. UMAP by sample
+
+```{r}
+DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "sample_id",
+  raster = TRUE
+)
+```
+
+## 12.2. UMAP by cluster
+
+```{r}
+DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE,
+  repel = TRUE,
+  raster = TRUE
+)
+```
+
+# 13. Cluster marker analysis
+
+**Important:** This marker analysis uses all cells; no cell subsampling is performed.
+
+```{r}
+sepsis_full[["RNA"]] <-
+  JoinLayers(
+    sepsis_full[["RNA"]]
+  )
+```
+
+```{r}
+Idents(sepsis_full) <-
+  "seurat_clusters"
+
+markers <- FindAllMarkers(
+  sepsis_full,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25,
+  test.use = "wilcox"
+)
+```
+
+```{r}
+saveRDS(
+  markers,
+  file.path(
+    base_dir,
+    "markers_all_clusters.rds"
+  )
+)
+```
+
+# 14. Cell-type annotation
+
+The original workflow assigned cell-type labels by interpreting cluster marker expression. Because that annotation was performed separately from the clustering code, this report uses the saved annotated checkpoint if the current object does not yet contain a `cell_type` column.
+
+```{r}
+annotated_checkpoint <- file.path(
+  base_dir,
+  "sepsis_full_annotated.rds"
+)
+
+if (!"cell_type" %in% colnames(sepsis_full@meta.data)) {
+  if (file.exists(annotated_checkpoint)) {
+    sepsis_full <- readRDS(annotated_checkpoint)
+    message("Loaded saved annotated Seurat checkpoint.")
+  } else {
+    stop("Cell-type annotation is not present. Annotate clusters using the marker results, save the annotated object as sepsis_full_annotated.rds, then render again.")
+  }
+}
+
+stopifnot("cell_type" %in% colnames(sepsis_full@meta.data))
+table(sepsis_full$cell_type)
+```
+
+# 15. UMAP by annotated cell type
+
+```{r}
+Idents(sepsis_full) <-
+  "cell_type"
+
+p_umap_celltype <- DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "cell_type",
+  label = TRUE,
+  repel = TRUE,
+  raster = TRUE
+) +
+  ggtitle(
+    "GSE163668: UMAP by Cell Type"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 8
+    )
+  )
+
+p_umap_celltype
+```
+
+# 16. Clinical group annotation
+
+```{r}
+gse <- getGEO(
+  "GSE163668",
+  GSEMatrix = FALSE
+)
+
+pheno2 <- do.call(
+  rbind,
+  lapply(
+    GSMList(gse),
+    function(g) {
+
+      data.frame(
+        gsm = Meta(g)$geo_accession,
+        title = Meta(g)$title,
+        characteristics =
+          paste(
+            Meta(g)$characteristics_ch1,
+            collapse = " | "
+          )
+      )
+    }
+  )
+)
+```
+
+```{r}
+sample_meta <- pheno2 %>%
+  transmute(
+    gsm = gsm,
+    title = title,
+    pooled = str_detect(
+      characteristics,
+      "pooled: TRUE"
+    ),
+    covid_status = str_trim(
+      str_match(
+        characteristics,
+        "covid_status: ([^|]+)"
+      )[, 2]
+    ),
+    phenotype = str_trim(
+      str_match(
+        characteristics,
+        "phenotype: ([^|]+)"
+      )[, 2]
+    )
+  ) %>%
+  mutate(
+    group = case_when(
+      pooled ~ "Pooled",
+
+      phenotype == "CONTROL" ~
+        "Control",
+
+      covid_status == "POSITIVE" &
+        phenotype == "SEVERE" ~
+        "COVID_SEVERE",
+
+      covid_status == "POSITIVE" &
+        phenotype == "M/M" ~
+        "COVID_MM",
+
+      covid_status == "NEGATIVE" ~
+        "COVID_NEG_patient",
+
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+sepsis_full$gsm <-
+  sub(
+    "_.*",
+    "",
+    sepsis_full$sample_id
+  )
+
+idx <- match(
+  sepsis_full$gsm,
+  sample_meta$gsm
+)
+
+sepsis_full$group <-
+  sample_meta$group[idx]
+
+sepsis_full$pooled <-
+  sample_meta$pooled[idx]
+
+table(
+  sepsis_full$group,
+  useNA = "ifany"
+)
+```
+
+# 17. UMAP by clinical group
+
+```{r}
+p_umap_group <- DimPlot(
+  sepsis_full,
+  reduction = "umap",
+  group.by = "group",
+  raster = TRUE
+) +
+  ggtitle(
+    "GSE163668: UMAP by Clinical Group"
+  ) +
+  theme_classic()
+
+p_umap_group
+```
+
+# 18. Cell counts by clinical group
+
+```{r}
+group_counts <- as.data.frame(
+  table(sepsis_full$group)
+)
+
+colnames(group_counts) <- c(
+  "Group",
+  "Number_of_Cells"
+)
+
+group_counts
+```
+
+```{r}
+p_group_counts <- ggplot(
+  group_counts,
+  aes(
+    x = reorder(
+      Group,
+      Number_of_Cells
+    ),
+    y = Number_of_Cells
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title =
+      "Cell Distribution Across Clinical Groups",
+    x = NULL,
+    y = "Number of Cells"
+  ) +
+  theme_classic()
+
+p_group_counts
+```
+
+# 19. Differential expression results
+
+The pseudobulk differential-expression results were generated using edgeR at the biological-sample level.
+
+```{r}
+de_file <- file.path(
+  base_dir,
+  "DE_all_celltypes",
+  "all_celltypes_edgeR_results.rds"
+)
+
+if (!file.exists(de_file)) {
+  stop("Differential-expression results file not found: ", de_file)
+}
+
+all_DE_results <- readRDS(de_file)
+
+names(all_DE_results)
+```
+
+```{r}
+if (!is.null(all_DE_results[["NK"]]$results)) {
+  names(all_DE_results[["NK"]]$results)
+} else {
+  message("NK result structure differs; inspect names(all_DE_results) above.")
+}
+```
+
+# 20. GSEA results
+
+The final GSEA results were generated from the saved differential-expression rankings using Gene Ontology Biological Process gene sets.
+
+```{r}
+gsea_results_file <- file.path(
+  gsea_dir,
+  "combined_GSEA_eps0.csv"
+)
+
+if (!file.exists(gsea_results_file)) {
+  stop("GSEA results file not found: ", gsea_results_file)
+}
+
+gsea <- read.csv(
+  gsea_results_file,
+  check.names = FALSE
+)
+
+dim(gsea)
+colnames(gsea)
+head(gsea)
+```
+
+# 21. Significant GSEA pathways
+
+```{r}
+gsea_sig <- gsea %>%
+  filter(
+    !is.na(p.adjust),
+    p.adjust < 0.05
+  )
+
+nrow(gsea_sig)
+```
+
+# 22. Significant pathway counts
+
+```{r}
+pathway_counts <- read.csv(
+  file.path(
+    fig_dir,
+    "GSEA_Significant_Pathway_Counts.csv"
+  )
+)
+
+aggregate(
+  significant_pathways ~ comparison,
+  data = pathway_counts,
+  FUN = sum
+)
+```
+
+# 23. Final GSEA figure
+
+```{r}
+p_gsea_counts <- ggplot(
+  pathway_counts,
+  aes(
+    x = comparison,
+    y = cell_type,
+    fill = significant_pathways
+  )
+) +
+  geom_tile(
+    color = "white"
+  ) +
+  scale_fill_viridis_c(
+    option = "C",
+    name = "Significant\npathways"
+  ) +
+  labs(
+    title =
+      "Significant GSEA Pathways by Comparison",
+    subtitle =
+      "GO Biological Process; adjusted P value < 0.05",
+    x = "Comparison",
+    y = "Cell type"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    plot.title = element_text(
+      face = "bold"
+    ),
+    axis.text.x = element_text(
+      angle = 35,
+      hjust = 1
+    ),
+    panel.grid = element_blank()
+  )
+
+p_gsea_counts
+```
+
+# 24. Final object summary
+
+```{r}
+cat(
+  "Final dimensions:\n"
+)
+
+print(
+  dim(sepsis_full)
+)
+
+cat(
+  "\nTotal cells:\n"
+)
+
+print(
+  ncol(sepsis_full)
+)
+
+cat(
+  "\nTotal features:\n"
+)
+
+print(
+  nrow(sepsis_full)
+)
+
+cat(
+  "\nCell types:\n"
+)
+
+print(
+  sort(
+    table(
+      sepsis_full$cell_type
+    ),
+    decreasing = TRUE
+  )
+)
+
+cat(
+  "\nClinical groups:\n"
+)
+
+print(
+  table(
+    sepsis_full$group
+  )
+)
+```
+
+# 25. Save final Seurat object
+
+```{r}
+final_rds <- file.path(
+  final_project_dir,
+  "GSE163668_FINAL_seurat.rds"
+)
+
+saveRDS(
+  sepsis_full,
+  final_rds
+)
+
+file.exists(final_rds)
+```
+
+# 26. Save final figures
+
+```{r}
+ggsave(
+  file.path(
+    fig_dir,
+    "Figure1_UMAP_CellType.png"
+  ),
+  p_umap_celltype,
+  width = 13,
+  height = 9,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    fig_dir,
+    "Figure2_UMAP_Group.png"
+  ),
+  p_umap_group,
+  width = 11,
+  height = 8,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    fig_dir,
+    "Figure3_CellCounts_ByGroup.png"
+  ),
+  p_group_counts,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+
+ggsave(
+  file.path(
+    fig_dir,
+    "Figure6_GSEA_Significant_Pathways.png"
+  ),
+  p_gsea_counts,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+# 27. Final verification
+
+```{r}
+list.files(
+  fig_dir,
+  full.names = TRUE
+)
+```
+
