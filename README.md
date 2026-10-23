@@ -73,9 +73,11 @@ quarto render "GSE163668_Full_Analysis_Report (3).qmd"
 Results depend on data quality, sample composition, preprocessing choices, and cell-type annotation. Biological interpretations should be evaluated in the context of the original study and validated where appropriate.
 ## 📊 Interactive Analysis Report
 
-View the full Sepsis Single-Cell RNA-seq analysis report, including plots and results:
+Explore the full single-cell RNA-seq analysis of sepsis using the GSE163668 dataset, including quality control, doublet detection, dimensionality reduction, clustering, and visualizations.
 
-[Open the HTML Report](https://mohamedhamed90921.github.io/sepsis-single-cell-rna-seq/GSE163668_Full_Analysis_Report%20%283%29.html)
+**[View the Full Analysis Report](https://mohamedhamed90921.github.io/sepsis-single-cell-rna-seq/GSE163668_Full_Analysis_Report%20%283%29.html)**
+
+
 
 ## Author
 
